@@ -58,7 +58,7 @@ Close your terminal and open a new one. When you type in `anaconda3`, your new a
 * Clone the Applied ML repository using the command 
    `git clone https://github.com/AppliedMachineLearningNBI/AppliedML2026.git .`
 
- Feel free to choose another name for your folder, or just use "." if you want to use the same name (i.e. "AppliedML2025"), which is default/common.
+ Feel free to choose another name for your folder, or just use "." if you want to use the same name (i.e. "AppliedML2026"), which is default/common.
 
 * You now have a local copy of the repository
 
