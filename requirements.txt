@@ -44,3 +44,5 @@ bayesian-optimization
 optuna
 shap
 scikeras
+ipykernel>=7.2.0
+pandas-stubs
