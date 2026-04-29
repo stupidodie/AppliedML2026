@@ -4,3 +4,7 @@
 /Week0/cifar-10-batches-py/
 /Week0/cifar-10-python.tar.gz
 .DS_Store
+InitialProject/dataset/
+InitialProject/src/classification/__pycache__/
+InitialProject/src/classification/models/__pycache__/
+InitialProject/src/regression/__pycache__/
