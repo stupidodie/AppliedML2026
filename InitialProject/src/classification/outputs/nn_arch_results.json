@@ -1,0 +1,40 @@
+{
+  "original_v1": {
+    "log_loss": 0.125855,
+    "roc_auc": 0.990142,
+    "params": 13409
+  },
+  "baseline_rerun": {
+    "log_loss": 0.131985,
+    "roc_auc": 0.9896,
+    "params": 13409
+  },
+  "wide_deep_big": {
+    "log_loss": 0.118769,
+    "roc_auc": 0.990712,
+    "params": 48865
+  },
+  "deep_residual_v1": {
+    "log_loss": 0.11672,
+    "roc_auc": 0.991194,
+    "params": 444033
+  },
+  "wide_deep": {
+    "log_loss": 0.11338305040639363,
+    "roc_auc": 0.991539530916289,
+    "epochs": 133,
+    "params": 46209
+  },
+  "deep_res_light": {
+    "log_loss": 0.12019270419412821,
+    "roc_auc": 0.9911769463606666,
+    "epochs": 78,
+    "params": 79937
+  },
+  "wide_bn": {
+    "log_loss": 0.1312437383560081,
+    "roc_auc": 0.9896581380833315,
+    "epochs": 85,
+    "params": 46209
+  }
+}
