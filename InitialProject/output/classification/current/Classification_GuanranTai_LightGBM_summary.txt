@@ -1,0 +1,39 @@
+LightGBM Classification - Guanran Tai
+====================================
+
+Objective: Electron vs non-electron binary classification
+Metric: Binary Cross Entropy (LogLoss)
+
+Selected features (15):
+  1. p_sigmad0
+  2. p_TRTPID
+  3. p_numberOfInnermostPixelHits
+  4. p_ptPU30
+  5. pX_MultiLepton
+  6. p_etcone20
+  7. p_deltaEta1
+  8. p_dPOverP
+  9. p_d0
+  10. pX_ptconecoreTrackPtrCorrection
+  11. p_Rhad
+  12. p_deltaPhiRescaled2
+  13. pX_ambiguityType
+  14. p_charge
+  15. pX_topoetconecoreConeEnergyCorrection
+
+Best hyperparameters:
+  colsample_bytree: 0.6269978939536784
+  learning_rate: 0.013456002459790646
+  max_depth: 11
+  min_child_samples: 30
+  min_child_weight: 3.293213313323962
+  num_leaves: 192
+  reg_alpha: 0.0004970149057466571
+  reg_lambda: 4.585053594815347e-07
+  subsample: 0.8674793823643839
+
+Best CV (3-fold) LogLoss: 0.078411
+Holdout LogLoss: 0.073000
+Number of trees (best iteration): 1572
+Training time: 50.6s
+Random seed: 42

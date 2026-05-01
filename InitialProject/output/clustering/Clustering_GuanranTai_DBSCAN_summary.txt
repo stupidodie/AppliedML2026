@@ -1,0 +1,29 @@
+DBSCAN Clustering - Guanran Tai
+===============================
+
+Objective: Unsupervised clustering of SDSS-Gaia stars
+Algorithm: DBSCAN (scikit-learn)
+
+Selected features (6):
+  1. CO_FE
+  2. H
+  3. Lz
+  4. O_FE
+  5. SI_FE
+  6. V_FE
+
+Parameters:
+  eps: 0.8266
+  min_samples: 10
+  k-neighbors for eps detection: 12
+
+Number of clusters: 4
+Noise points reassigned to nearest clusters
+
+Internal metrics:
+  Silhouette Score:  0.4303
+  Calinski-Harabasz: 711.00
+  Davies-Bouldin:    1.5202
+
+Training time: 0.0s
+Random seed: 42

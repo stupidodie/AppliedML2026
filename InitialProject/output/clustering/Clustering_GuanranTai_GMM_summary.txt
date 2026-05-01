@@ -1,0 +1,26 @@
+GMM Clustering - Guanran Tai
+============================
+
+Objective: Unsupervised clustering of SDSS-Gaia stars
+Algorithm: Gaussian Mixture Model (scikit-learn)
+
+Selected features (6):
+  1. Energy
+  2. H
+  3. Lz
+  4. MG_FE
+  5. O_FE
+  6. V_FE
+
+Number of components: 13
+Covariance type: full
+
+Internal metrics:
+  Silhouette Score:  0.0577
+  Calinski-Harabasz: 924.71
+  Davies-Bouldin:    2.2287
+  BIC:               50439.5
+  AIC:               48010.6
+
+Training time: 1.3s
+Random seed: 42

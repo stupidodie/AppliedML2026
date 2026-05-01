@@ -1,0 +1,49 @@
+PyTorch NN Classification (Ensemble+Calibration) - GuanranTai
+============================================================
+
+Objective: Electron vs non-electron binary classification
+Metric: Binary Cross Entropy (LogLoss) - unweighted
+
+Architecture: MLP [15, 128, 64, 1]
+  Activation: relu  Dropout: 0.304  BatchNorm: False
+  Learning rate: 0.00214  Weight decay: 2.58e-06
+  Params (per model): 10,369
+
+Training: 7 models, 600 max epochs, early stop=50
+Label smoothing: 0.0
+Calibration: platt_logits
+
+Feature selection: L1 first-layer weights
+  (5 models averaged, arch=[256,128,64])
+Selected features (15):
+  1. p_TRTPID
+  2. p_numberOfInnermostPixelHits
+  3. pX_MultiLepton
+  4. p_dPOverP
+  5. p_d0
+  6. p_deltaEta1
+  7. p_numberOfPixelHits
+  8. p_vertex
+  9. pX_deltaEta2
+  10. p_sigmad0
+  11. pX_deltaPhiFromLastMeasurement
+  12. pX_deltaPhiRescaled1
+  13. pX_ambiguityType
+  14. pX_E_Lr0_HiG
+  15. pX_core57cellsEnergyCorrection
+
+Per-model holdout LogLosses:
+  Model 1: 0.109482
+  Model 2: 0.110084
+  Model 3: 0.110051
+  Model 4: 0.109476
+  Model 5: 0.109512
+  Model 6: 0.110319
+  Model 7: 0.109426
+Ensemble (raw) holdout LogLoss: 0.108462
+Ensemble (Platt) holdout LogLoss: 0.106807
+Ensemble (isotonic) holdout LogLoss: 0.110220
+Selected calibration: platt_logits (holdout: 0.106807)
+
+Device: mps
+Seed: 42

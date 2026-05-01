@@ -1,0 +1,23 @@
+K-Means Clustering - Guanran Tai
+================================
+
+Objective: Unsupervised clustering of SDSS-Gaia stars
+Algorithm: K-Means (scikit-learn)
+
+Selected features (6):
+  1. CO_FE
+  2. CR_FE
+  3. Energy
+  4. FE_H
+  5. H
+  6. N_FE
+
+Number of clusters (K): 4
+
+Internal metrics:
+  Silhouette Score:  0.3777
+  Calinski-Harabasz: 1253.84
+  Davies-Bouldin:    1.2201
+
+Training time: 0.1s
+Random seed: 42

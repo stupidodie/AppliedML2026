@@ -1,0 +1,39 @@
+Autoencoder + K-Means Clustering - Guanran Tai
+===============================================
+
+Objective: Unsupervised clustering of SDSS-Gaia stars
+Algorithm: Autoencoder (PyTorch NN) + K-Means on latent space
+
+Autoencoder architecture:
+  Input: 6 features
+  Encoder: 6 -> [32, 16] -> 2
+  Decoder: 2 -> [16, 32] -> 6
+  Total parameters: 1768
+  Activation: ReLU, BatchNorm
+
+Training:
+  Loss: MSE
+  Optimizer: Adam (lr=0.001, wd=1e-05)
+  Epochs: 200 (early stopping patience=30)
+  Batch size: 256
+  Final reconstruction loss: 0.175088
+  Training time: 40.0s
+  Device: mps
+
+Selected features (6):
+  1. CO_FE
+  2. Energy
+  3. H
+  4. MG_FE
+  5. O_FE
+  6. V_FE
+
+K-Means on 2D latent space:
+  Number of clusters: 4
+
+Internal metrics (original feature space):
+  Silhouette Score:  0.2256
+  Calinski-Harabasz: 1473.97
+  Davies-Bouldin:    1.6641
+
+Random seed: 42
