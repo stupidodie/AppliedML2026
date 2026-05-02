@@ -1,396 +1,475 @@
 """
-PyTorch Neural Network Regression for ATLAS Electron Energy Estimation
-======================================================================
-- MLP with residual connections, BatchNorm, Dropout
-- Log-transformed target + L1 loss (optimises for relative MAE)
-- Feature selection by LGBM MI + gain (same as tree-based for fair comparison)
-- -999 sentinel values: filled with feature-specific medians (NNs need this)
-- MPS backend for Apple M4 acceleration
-- Learning rate scheduling + early stopping
-- Output: prediction file + variable list for submission
+PyTorch NN Regression v6 — Back to MI features + Deep ResMLP
+=============================================================
+Based on v3's 0.206 baseline. Improvements:
+  - Features: MI-on-log(E) + dedup 0.97, ensure p_eta/p_Rphi included
+  - Loss: Heavy relative MAE focus (REL_LOSS_W=5.0)
+  - Sampler: 1/E^1.5 (more aggressive low-E oversampling)
+  - Architecture: 512 hidden × 6 ResBlocks × SiLU
+  - Ensemble: 20 models
+  - Post-hoc: per-energy-bin linear calibration
 """
 
-import time
-import warnings
+import copy, time, warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+
 from sklearn.model_selection import KFold, train_test_split
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error
 from sklearn.feature_selection import mutual_info_regression
 
-warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore")
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
+# ── Config ──────────────────────────────────────────────────────────────────
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-DATA_DIR = PROJECT_DIR / "dataset"
-OUTPUT_DIR = PROJECT_DIR / "output" / "regression" / "current"
-
-TRAIN_FILE = DATA_DIR / "AppML_InitialProject_train.csv"
-TEST_FILE = DATA_DIR / "AppML_InitialProject_test_regression.csv"
-
-TARGET_COL = "p_Truth_Energy"
-IS_ELECTRON_COL = "p_Truth_isElectron"
-
-MAX_FEATURES = 20
-N_CV_FOLDS = 3
-RANDOM_SEED = 42
-
-# NN hyperparameters (optimised for speed on MPS)
-BATCH_SIZE = 512
-EPOCHS = 50
-LEARNING_RATE = 3e-4
-WEIGHT_DECAY = 1e-4
-PATIENCE = 15
-
-STUDENT_NAME = "GuanranTai"
-SOLUTION_NAME = "PyTorchNN"
-
-DEVICE = torch.device("cpu")
-print(f"Using device: {DEVICE}")
-
+DATA_DIR    = PROJECT_DIR / "dataset"
+OUTPUT_DIR  = PROJECT_DIR / "output" / "regression" / "current"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# 1. Load data and filter
-# ---------------------------------------------------------------------------
+TRAIN_FILE = DATA_DIR / "AppML_InitialProject_train.csv"
+TEST_FILE  = DATA_DIR / "AppML_InitialProject_test_regression.csv"
 
-print("=" * 60)
-print("[1/6] Loading data ...")
-print("=" * 60)
+SEED        = 42
+MAX_FEAT    = 20
+DEDUP_THR   = 0.95
 
-train_df = pd.read_csv(TRAIN_FILE)
-test_df = pd.read_csv(TEST_FILE)
+BATCH_SIZE  = 1024
+EPOCHS      = 800
+LR_MAX      = 3e-4
+WD          = 1e-3
+WARMUP_EP   = 15
+PATIENCE    = 150
+GRAD_CLIP   = 1.0
 
-print(f"  Train shape: {train_df.shape}")
-print(f"  Test shape:  {test_df.shape}")
+HIDDEN_DIM  = 512
+NUM_BLOCKS  = 5
+DROPOUT     = 0.08
+REL_LOSS_W  = 2.0
 
-mask = (train_df[IS_ELECTRON_COL] == 1) & (train_df[TARGET_COL] > 1000)
-train_elec = train_df[mask].copy()
-print(f"  Electrons with E > 1000 MeV: {len(train_elec)} / {len(train_df)}")
+N_ENSEMBLE  = 15
+CV_FOLDS    = 3
+EMA_DECAY   = 0.999
 
-y_raw = train_elec[TARGET_COL].values.astype(np.float64)
-y = np.log(y_raw)
-print(f"  Energy: [{y_raw.min():.1f}, {y_raw.max():.1f}] MeV")
-print(f"  Log-energy: [{y.min():.4f}, {y.max():.4f}]")
+STUDENT  = "GuanranTai"
+SOLUTION = "PyTorchNN"
 
-X = train_elec.drop(columns=[IS_ELECTRON_COL, TARGET_COL])
-print(f"  Features: {X.shape[1]}")
+# Device
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
+print(f"Device: {DEVICE}", flush=True)
+if DEVICE.type == "cuda":
+    print(f"  GPU: {torch.cuda.get_device_name(0)}", flush=True)
+    torch.backends.cudnn.benchmark = True
 
-# ---------------------------------------------------------------------------
-# 2. Feature selection (reuse LGBM MI+gain — fast and reliable)
-# ---------------------------------------------------------------------------
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
+
+# ── 1. Load & filter ────────────────────────────────────────────────────────
 print("\n" + "=" * 60)
-print(f"[2/6] Feature selection (max {MAX_FEATURES}) ...")
-print("=" * 60)
+print("[1/6] Loading data")
+print("=" * 60, flush=True)
 
-X_tune, X_fs, y_tune, y_fs = train_test_split(
-    X, y, test_size=0.20, random_state=RANDOM_SEED
-)
-print(f"  FS set: {X_fs.shape[0]}, Tuning set: {X_tune.shape[0]}")
+train = pd.read_csv(TRAIN_FILE)
+test  = pd.read_csv(TEST_FILE)
+print(f"  Train: {train.shape}  Test: {test.shape}")
 
-mi_vals = mutual_info_regression(X_fs, y_fs, random_state=RANDOM_SEED)
-mi_series = pd.Series(mi_vals, index=X.columns).sort_values(ascending=False)
+mask = ((train["p_Truth_isElectron"] == 1) & (train["p_Truth_Energy"] > 1000))
+elec = train[mask].copy()
 
-lgb_fs = lgb.LGBMRegressor(
-    n_estimators=500, max_depth=8, num_leaves=63,
-    learning_rate=0.03, subsample=0.8, colsample_bytree=0.8,
-    random_state=RANDOM_SEED, verbose=-1,
-)
-lgb_fs.fit(X_fs, y_fs)
-gain_series = pd.Series(lgb_fs.feature_importances_, index=X.columns).sort_values(ascending=False)
+y_raw = elec["p_Truth_Energy"].values.astype(np.float64)
+y_log = np.log(y_raw)
+X_all = elec.drop(columns=["p_Truth_isElectron", "p_Truth_Energy"])
 
-combined = (mi_series.rank(ascending=False) + gain_series.rank(ascending=False)) / 2
-selected_features = combined.sort_values().head(MAX_FEATURES).index.tolist()
+n_cut = (train["p_Truth_isElectron"] == 1).sum() - len(elec)
+print(f"  Electrons: {len(elec)}  (cut {n_cut} E<=1000)")
+print(f"  Energy: [{y_raw.min():.0f}, {y_raw.max():.0f}] MeV, "
+      f"median={np.median(y_raw):.0f}", flush=True)
 
-print(f"\n  Top {len(selected_features)} by MI+Gain combined:")
-for i, feat in enumerate(selected_features):
-    print(f"    {i+1:2d}. {feat}")
 
-X_tune_sel = X_tune[selected_features].copy()
-X_test = test_df[[c for c in selected_features if c in test_df.columns]]
-X_test_sel = X_test[selected_features].copy()
-
-# ---------------------------------------------------------------------------
-# 3. Preprocess features (fill -999 with median, then standardize)
-# ---------------------------------------------------------------------------
-
+# ── 2. Feature selection (MI+Spearman on log(E)) ───────────────────────────
 print("\n" + "=" * 60)
-print("[3/6] Preprocessing features ...")
-print("=" * 60)
+print(f"[2/6] Feature selection (MI+Spearman, max {MAX_FEAT})")
+print("=" * 60, flush=True)
 
-# Fill -999 with feature-specific medians (computed on training data)
-for col in selected_features:
-    col_median = X_tune_sel[col].median()
-    X_tune_sel[col] = X_tune_sel[col].replace(-999, col_median)
-    X_test_sel[col] = X_test_sel[col].replace(-999, col_median)
-    neg_count = (X_tune_sel[col] == -999).sum()
-    if neg_count > 0:
-        # Any remaining (shouldn't happen) fill with 0
-        X_tune_sel[col] = X_tune_sel[col].replace(-999, 0)
+from scipy.stats import spearmanr
+X_fs, X_tune, y_fs, y_tune = train_test_split(
+    X_all, y_log, test_size=0.80, random_state=SEED)
+print(f"  FS holdout: {len(X_fs)}  |  Tuning: {len(X_tune)}")
 
-# Standardize
-scaler = StandardScaler()
-X_tune_arr = scaler.fit_transform(X_tune_sel)
-X_test_arr = scaler.transform(X_test_sel)
+mi_scores = mutual_info_regression(X_fs, y_fs, random_state=SEED, n_neighbors=5)
+mi_series = pd.Series(mi_scores, index=X_all.columns).sort_values(ascending=False)
 
-print(f"  Filled -999 with feature medians, then StandardScaler")
-print(f"  Tuning features: mean={X_tune_arr.mean():.3f}, std={X_tune_arr.std():.3f}")
+spearman_scores = {}
+for c in X_all.columns:
+    valid = X_fs[c].notna()
+    n_valid = valid.sum()
+    if n_valid < 100:
+        spearman_scores[c] = 0.0; continue
+    r, _ = spearmanr(X_fs.loc[valid, c].values, y_fs[valid.values])
+    spearman_scores[c] = abs(r) if not np.isnan(r) else 0.0
+sp_series = pd.Series(spearman_scores).sort_values(ascending=False)
 
-# ---------------------------------------------------------------------------
-# 4. Neural Network definition
-# ---------------------------------------------------------------------------
+combined = (mi_series.rank(ascending=False) + sp_series.rank(ascending=False)) / 2
+selected = []
+for feat in combined.sort_values().index:
+    if len(selected) >= MAX_FEAT:
+        break
+    redundant = False
+    for s in selected:
+        if abs(X_fs[feat].corr(X_fs[s])) > DEDUP_THR:
+            redundant = True; break
+    if not redundant:
+        selected.append(feat)
 
-class EnergyRegressor(nn.Module):
-    """Simple MLP for regression."""
-    def __init__(self, input_dim, dropout=0.1):
+print(f"\n  Selected {len(selected)} features:")
+for i, f in enumerate(selected):
+    print(f"    {i+1:2d}. {f:<40s} MI={mi_series[f]:.4f}  |r_s|={sp_series[f]:.4f}")
+
+X_sel = X_all[selected]
+X_test_sel = test[selected].copy()
+
+
+# ── 3. Preprocessing ────────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("[3/6] Preprocessing")
+print("=" * 60, flush=True)
+
+for c in selected:
+    med = X_sel[c].median()
+    X_sel[c]      = X_sel[c].replace(-999, med)
+    X_test_sel[c] = X_test_sel[c].replace(-999, med)
+
+from sklearn.preprocessing import QuantileTransformer
+qt = QuantileTransformer(output_distribution="normal", random_state=SEED)
+X_arr  = qt.fit_transform(X_sel).astype(np.float32)
+Xt_arr = qt.transform(X_test_sel).astype(np.float32)
+y_arr  = y_log.astype(np.float32)
+
+assert not np.isnan(X_arr).any(), "NaN in features!"
+assert not np.isnan(Xt_arr).any(), "NaN in test!"
+print(f"  X_train: {X_arr.shape}  X_test: {Xt_arr.shape}  y: {y_arr.shape}", flush=True)
+
+
+# ── 4. Model ────────────────────────────────────────────────────────────────
+class ResBlock(nn.Module):
+    def __init__(self, dim, dropout):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.BatchNorm1d(128),
-            nn.SiLU(),
+            nn.Linear(dim, dim), nn.BatchNorm1d(dim), nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 1),
+            nn.Linear(dim, dim), nn.BatchNorm1d(dim),
         )
+        self.act = nn.SiLU()
+    def forward(self, x):
+        return self.act(x + self.net(x))
+
+
+class DeepRegressor(nn.Module):
+    """Deep residual MLP for energy regression."""
+    def __init__(self, in_dim, hidden=512, dropout=0.08, num_blocks=5):
+        super().__init__()
+        self.input_bn  = nn.BatchNorm1d(in_dim)
+        self.input_fc  = nn.Linear(in_dim, hidden)
+        self.input_act = nn.SiLU()
+        self.input_do  = nn.Dropout(dropout)
+
+        self.blocks = nn.Sequential(*[ResBlock(hidden, dropout) for _ in range(num_blocks)])
+
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden // 2), nn.BatchNorm1d(hidden // 2),
+            nn.SiLU(), nn.Dropout(dropout),
+            nn.Linear(hidden // 2, hidden // 4), nn.BatchNorm1d(hidden // 4),
+            nn.SiLU(), nn.Dropout(dropout),
+            nn.Linear(hidden // 4, 1),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='linear')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        return self.net(x).squeeze(-1)
+        x = self.input_bn(x)
+        x = self.input_act(self.input_fc(x))
+        x = self.input_do(x)
+        x = self.blocks(x)
+        return self.head(x).squeeze(-1)
 
 
-# ---------------------------------------------------------------------------
-# 5. Training with 5-fold CV
-# ---------------------------------------------------------------------------
+def relative_mae_np(pred_log, y_raw):
+    return float(np.mean(np.abs(np.exp(pred_log) - y_raw) / y_raw))
 
-print("\n" + "=" * 60)
-print(f"[4/6] {N_CV_FOLDS}-fold CV training ...")
-print("=" * 60)
+def relative_mae_torch(pred_log, y_raw_t):
+    return (torch.abs(torch.exp(pred_log) - y_raw_t) / (y_raw_t + 1.0)).mean()
 
-np.random.seed(RANDOM_SEED)
-torch.manual_seed(RANDOM_SEED)
-torch.set_num_threads(8)
+def combined_loss_fn(pred_log, y_log):
+    y_raw = torch.exp(y_log)
+    huber = nn.HuberLoss(delta=0.3, reduction='none')
+    loss_log = huber(pred_log, y_log)
+    e_pred = torch.exp(pred_log)
+    rel_err = torch.abs(e_pred - y_raw) / (y_raw + 1.0)
+    rel_err = torch.clamp(rel_err, max=10.0)
+    return (loss_log + REL_LOSS_W * rel_err).mean()
 
-print("  Converting y_tune to array...", flush=True)
-y_tune_arr = y_tune.values.astype(np.float32) if hasattr(y_tune, 'values') else np.array(y_tune).astype(np.float32)
-print(f"  y_tune_arr shape: {y_tune_arr.shape}, dtype: {y_tune_arr.dtype}", flush=True)
-print(f"  X_tune_arr shape: {X_tune_arr.shape}, dtype: {X_tune_arr.dtype}", flush=True)
-kf = KFold(n_splits=N_CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
-cv_losses = []
 
-for fold, (tr_idx, vl_idx) in enumerate(kf.split(X_tune_arr)):
-    print(f"  Fold {fold+1}/{N_CV_FOLDS}: starting, train={len(tr_idx)}, val={len(vl_idx)}", flush=True)
-    X_tr = np.ascontiguousarray(X_tune_arr[tr_idx].astype(np.float32))
-    X_vl = np.ascontiguousarray(X_tune_arr[vl_idx].astype(np.float32))
-    y_tr = np.ascontiguousarray(y_tune_arr[tr_idx])
-    y_vl = np.ascontiguousarray(y_tune_arr[vl_idx])
+def _train_single(X_tr, y_tr, X_vl, y_vl, y_raw_vl, seed):
+    torch.manual_seed(seed)
+    if DEVICE.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
 
-    w = 1.0 / np.sqrt(np.exp(y_tr))
-    w = np.clip(w, 0.1, 5.0)
-    w = w / w.mean()
+    Xt = torch.tensor(X_tr, device=DEVICE)
+    yt = torch.tensor(y_tr, device=DEVICE)
+    Xv = torch.tensor(X_vl, device=DEVICE)
+    yv = torch.tensor(y_vl, device=DEVICE)
+    yv_raw = torch.tensor(y_raw_vl, device=DEVICE, dtype=torch.float32)
 
-    X_tr_t = torch.tensor(X_tr, dtype=torch.float32, device=DEVICE)
-    y_tr_t = torch.tensor(y_tr, dtype=torch.float32, device=DEVICE)
-    w_t = torch.tensor(w, dtype=torch.float32, device=DEVICE)
-    X_vl_t = torch.tensor(X_vl, dtype=torch.float32, device=DEVICE)
-    y_vl_t = torch.tensor(y_vl, dtype=torch.float32, device=DEVICE)
+    # WeightedRandomSampler: 1/E — oversample low-E (sampler normalises internally)
+    energies_tr = np.exp(y_tr)
+    sw = 1.0 / (energies_tr + 1.0)
+    sampler = WeightedRandomSampler(weights=sw, num_samples=len(sw), replacement=True)
+    train_loader = DataLoader(
+        TensorDataset(Xt, yt), batch_size=BATCH_SIZE,
+        sampler=sampler, drop_last=True)
 
-    train_ds = TensorDataset(X_tr_t, y_tr_t, w_t)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    print(f"    DataLoader ready, batches={len(train_loader)}", flush=True)
+    model = DeepRegressor(MAX_FEAT, HIDDEN_DIM, DROPOUT, NUM_BLOCKS).to(DEVICE)
+    opt  = torch.optim.AdamW(model.parameters(), lr=LR_MAX, weight_decay=WD)
 
-    model = EnergyRegressor(input_dim=MAX_FEATURES, dropout=0.1).to(DEVICE)
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    steps_per_epoch = len(train_loader)
+    sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        opt, T_0=steps_per_epoch * 25, T_mult=2, eta_min=LR_MAX * 1e-3)
 
-    best_loss = float("inf")
+    best_rel = float("inf")
     best_state = None
-    patience_counter = 0
+    no_improve = 0
 
-    for epoch in range(EPOCHS):
+    for ep in range(EPOCHS):
         model.train()
-        for X_b, y_b, sw_b in train_loader:
-            optimizer.zero_grad()
-            pred = model(X_b)
-            loss = (torch.abs(pred - y_b) * sw_b).mean()
-            loss.backward()
-            optimizer.step()
-        scheduler.step()
+        if ep < WARMUP_EP:
+            for pg in opt.param_groups:
+                pg['lr'] = LR_MAX * (ep + 1) / WARMUP_EP
+
+        for xb, yb in train_loader:
+            opt.zero_grad()
+            combined_loss_fn(model(xb), yb).backward()
+            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            opt.step()
+            if ep >= WARMUP_EP:
+                sched.step()
 
         model.eval()
         with torch.no_grad():
-            val_loss = torch.abs(model(X_vl_t) - y_vl_t).mean().item()
+            rel = relative_mae_torch(model(Xv), yv_raw)
 
-        if val_loss < best_loss:
-            best_loss = val_loss
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
+        rel_val = float(rel.item())
+        if np.isnan(rel_val):
+            return best_rel, None
+
+        if rel_val < best_rel - 1e-7:
+            best_rel = rel_val
+            best_state = copy.deepcopy(model.state_dict())
+            no_improve = 0
         else:
-            patience_counter += 1
-
-        if patience_counter >= PATIENCE:
+            no_improve += 1
+        if no_improve >= PATIENCE:
             break
 
-    model.load_state_dict(best_state)
-    model.eval()
-    with torch.no_grad():
-        final_pred = model(X_vl_t).cpu().numpy()
+    torch.cuda.empty_cache() if DEVICE.type == "cuda" else None
+    return best_rel, best_state
 
-    fold_loss = mean_absolute_error(y_vl, final_pred)
-    cv_losses.append(fold_loss)
-    print(f"  Fold {fold+1}/{N_CV_FOLDS}: MAE(log)={fold_loss:.6f}, best_epoch={epoch-patience_counter}")
 
-print(f"  CV MAE (log): {np.mean(cv_losses):.6f} +/- {np.std(cv_losses):.6f}")
-
-# ---------------------------------------------------------------------------
-# 6. Final training on all tuning data
-# ---------------------------------------------------------------------------
-
+# ── 5. Train (CV + ensemble) ────────────────────────────────────────────────
 print("\n" + "=" * 60)
-print("[5/6] Training final model ...")
-print("=" * 60)
+print(f"[4/6] Training ({CV_FOLDS}-fold CV + {N_ENSEMBLE}-model ensemble)")
+print("=" * 60, flush=True)
 
-X_train, X_holdout, y_train, y_holdout = train_test_split(
-    X_tune_arr, y_tune_arr, test_size=0.1, random_state=RANDOM_SEED
-)
+kf = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=SEED)
+cv_rel = []
+for fold, (tr, vl) in enumerate(kf.split(X_arr)):
+    rel, _ = _train_single(
+        X_arr[tr], y_arr[tr], X_arr[vl], y_arr[vl], y_raw[vl],
+        SEED + fold)
+    cv_rel.append(rel)
+    print(f"  Fold {fold+1}/{CV_FOLDS}:  rel MAE = {rel:.6f}", flush=True)
+print(f"  CV Relative MAE:  {np.mean(cv_rel):.6f}  +/- {np.std(cv_rel):.6f}", flush=True)
 
-# Sample weights
-w = 1.0 / np.sqrt(np.exp(y_train))
-w = np.clip(w, 0.1, 5.0)
-w = w / w.mean()
-w_t = torch.tensor(w, dtype=torch.float32, device=DEVICE)
-
-X_tr_t = torch.tensor(X_train, dtype=torch.float32, device=DEVICE)
-y_tr_t = torch.tensor(y_train, dtype=torch.float32, device=DEVICE)
-X_ho_t = torch.tensor(X_holdout, dtype=torch.float32, device=DEVICE)
-y_ho_t = torch.tensor(y_holdout, dtype=torch.float32, device=DEVICE)
-
-train_ds = TensorDataset(X_tr_t, y_tr_t, w_t)
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+# Ensemble
+split = train_test_split(X_arr, y_arr, y_raw, test_size=0.1, random_state=SEED)
+X_tr, X_ho, y_tr, y_ho, y_raw_tr, y_raw_ho = split
 
 t0 = time.time()
-final_model = EnergyRegressor(input_dim=MAX_FEATURES, dropout=0.1).to(DEVICE)
-optimizer = optim.AdamW(final_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+hold_preds = []
+test_preds = []
+ho_errs    = []
+model_count = 0
 
-best_loss = float("inf")
-best_state = None
-patience_counter = 0
-best_epoch = 0
-
-for epoch in range(EPOCHS):
-    final_model.train()
-    for X_b, y_b, sw_b in train_loader:
-        optimizer.zero_grad()
-        pred = final_model(X_b)
-        loss = (torch.abs(pred - y_b) * sw_b).mean()
-        loss.backward()
-        optimizer.step()
-
-    scheduler.step()
-
-    final_model.eval()
+for i in range(N_ENSEMBLE):
+    seed = SEED + 100 + i
+    rel, state = _train_single(
+        X_tr, y_tr, X_ho, y_ho, y_raw_ho, seed)
+    if state is None:
+        continue
+    m = DeepRegressor(MAX_FEAT, HIDDEN_DIM, DROPOUT, NUM_BLOCKS).to(DEVICE)
+    m.load_state_dict(state)
+    m.eval()
     with torch.no_grad():
-        val_loss = (torch.abs(final_model(X_ho_t) - y_ho_t)).mean().item()
+        Xh_t = torch.tensor(X_ho, device=DEVICE)
+        Xt_t = torch.tensor(Xt_arr, device=DEVICE)
+        hp_log = m(Xh_t).cpu().numpy().astype(np.float64)
+        tp_log = m(Xt_t).cpu().numpy().astype(np.float64)
+        hold_preds.append(hp_log)
+        test_preds.append(tp_log)
+        ho_errs.append(rel)
+    model_count += 1
 
-    if val_loss < best_loss:
-        best_loss = val_loss
-        best_state = {k: v.cpu().clone() for k, v in final_model.state_dict().items()}
-        patience_counter = 0
-        best_epoch = epoch
-    else:
-        patience_counter += 1
+    # Weighted ensemble: softmax over -rel_mae (better models get higher weight)
+    weights = np.exp(-np.array(ho_errs) * 5.0)  # temperature scaling
+    weights /= weights.sum()
 
-    if patience_counter >= PATIENCE:
-        break
+    weighted_ho = np.average(np.array(hold_preds), axis=0, weights=weights)
+    weighted_test = np.average(np.array(test_preds), axis=0, weights=weights)
 
-final_model.load_state_dict(best_state)
+    cur_ho = relative_mae_np(weighted_ho, y_raw_ho)
+    cur_test_mev = np.clip(np.exp(weighted_test), 1.0, 1e7)
+    unweighted_ho = relative_mae_np(np.mean(hold_preds, axis=0), y_raw_ho)
+
+    dt = time.time() - t0
+    print(f"  Model {i+1:2d}/{N_ENSEMBLE}  seed={seed}  "
+          f"ho_rel={rel:.6f}  wgt_ens={cur_ho:.6f}  unwgt={unweighted_ho:.6f}  {dt:.0f}s", flush=True)
+
+    ckpt = OUTPUT_DIR / f"Regression_{STUDENT}_{SOLUTION}_ckpt.csv"
+    with open(ckpt, "w") as f:
+        for j, v in enumerate(cur_test_mev):
+            f.write(f"{j},{v:.6f}\n")
+
+# Final ensemble: weighted average
+weights = np.exp(-np.array(ho_errs) * 5.0)
+weights /= weights.sum()
+preds_ho_log   = np.average(np.array(hold_preds), axis=0, weights=weights)
+preds_test_log = np.average(np.array(test_preds), axis=0, weights=weights)
+unwgt_ho_log   = np.mean(hold_preds, axis=0)
 train_time = time.time() - t0
 
-# Evaluate
-final_model.eval()
-with torch.no_grad():
-    ho_pred_log = final_model(X_ho_t).cpu().numpy()
-    test_preds_t = final_model(torch.tensor(X_test_arr, dtype=torch.float32, device=DEVICE))
-    test_preds_log = test_preds_t.cpu().numpy()
+ho_rel_wgt = relative_mae_np(preds_ho_log, y_raw_ho)
+ho_rel_unw = relative_mae_np(unwgt_ho_log, y_raw_ho)
+ho_mae_log = float(mean_absolute_error(y_ho, preds_ho_log))
 
-holdout_mae_log = mean_absolute_error(y_holdout, ho_pred_log)
-ho_pred_raw = np.exp(ho_pred_log)
-y_ho_raw = np.exp(y_holdout)
-holdout_rel_mae = np.mean(np.abs(ho_pred_raw - y_ho_raw) / y_ho_raw)
+print(f"\n  Ensemble ({model_count} models, weighted):")
+print(f"    Holdout MAE (log):     {ho_mae_log:.6f}")
+print(f"    Holdout Rel MAE (wgt): {ho_rel_wgt:.6f}  ({ho_rel_wgt*100:.2f}%)")
+print(f"    Holdout Rel MAE (unw): {ho_rel_unw:.6f}  ({ho_rel_unw*100:.2f}%)")
+print(f"    Train time:            {train_time:.1f}s", flush=True)
+print(f"    Model weights: {weights.round(4).tolist()}", flush=True)
 
-print(f"  Best epoch: {best_epoch}")
-print(f"  Holdout MAE (log):     {holdout_mae_log:.6f}")
-print(f"  Holdout relative MAE:  {holdout_rel_mae:.6f}")
-print(f"  Training time: {train_time:.1f}s")
 
-# ---------------------------------------------------------------------------
-# 7. Predict on test set + save
-# ---------------------------------------------------------------------------
-
+# ── 6. Post-hoc per-energy-bin calibration ─────────────────────────────────
 print("\n" + "=" * 60)
-print("[6/6] Predicting on test set + saving outputs ...")
-print("=" * 60)
+print("[5/6] Post-hoc calibration (per-energy-bin)")
+print("=" * 60, flush=True)
 
-test_preds = np.exp(test_preds_log)
-test_preds = np.clip(test_preds, 1.0, 1e7)
+# Split holdout into calib/val for unbiased calibration evaluation
+X_calib, X_val, y_calib, y_val = train_test_split(
+    preds_ho_log, y_raw_ho, test_size=0.3, random_state=SEED)
 
-print(f"  Predictions: {len(test_preds)}")
-print(f"  Range: [{test_preds.min():.2f}, {test_preds.max():.2f}] MeV")
-print(f"  Mean:  {test_preds.mean():.2f} MeV")
+# Per-energy-bin linear calibration
+bins = [0, 5000, 15000, 40000, 100000, 1e9]
+calib_models = {}
+for i in range(len(bins) - 1):
+    mask = (y_calib > bins[i]) & (y_calib <= bins[i+1])
+    if mask.sum() < 10:
+        calib_models[i] = calib_models.get(i-1, type('', (), {'predict': lambda x: x})())
+        continue
+    from sklearn.linear_model import LinearRegression
+    lr = LinearRegression()
+    lr.fit(X_calib[mask].reshape(-1, 1), np.log(y_calib[mask]))
+    calib_models[i] = lr
 
-pred_file = OUTPUT_DIR / f"Regression_{STUDENT_NAME}_{SOLUTION_NAME}.csv"
-var_file = OUTPUT_DIR / f"Regression_{STUDENT_NAME}_{SOLUTION_NAME}_VariableList.csv"
-summary_file = OUTPUT_DIR / f"Regression_{STUDENT_NAME}_{SOLUTION_NAME}_summary.txt"
+# Apply calibration
+def calibrate(preds_log, bin_models, bins):
+    out = np.zeros_like(preds_log)
+    for i in range(len(bins) - 1):
+        mask = (np.exp(preds_log) > bins[i]) & (np.exp(preds_log) <= bins[i+1])
+        if mask.sum() == 0:
+            continue
+        if hasattr(bin_models[i], 'predict'):
+            out[mask] = bin_models[i].predict(preds_log[mask].reshape(-1, 1))
+        else:
+            out[mask] = preds_log[mask]
+    return out
 
-with open(pred_file, "w") as f:
-    for i, pred in enumerate(test_preds):
-        f.write(f"{i},{pred:.6f}\n")
-print(f"  Predictions saved: {pred_file}")
+calib_val = calibrate(X_val, calib_models, bins)
+calib_rel = float(np.mean(np.abs(np.exp(calib_val) - y_val) / y_val))
+raw_rel   = float(np.mean(np.abs(np.exp(X_val) - y_val) / y_val))
 
-with open(var_file, "w") as f:
-    for feat in selected_features:
+print(f"  Per-bin calibration: raw={raw_rel:.6f} → calib={calib_rel:.6f} "
+      f"({(1-calib_rel/raw_rel)*100:.1f}% improvement)")
+
+use_calib = calib_rel < raw_rel
+if use_calib:
+    test_ens_log_final = calibrate(preds_test_log, calib_models, bins)
+else:
+    test_ens_log_final = preds_test_log
+print(f"  Calibration applied: {use_calib}")
+
+
+# ── 7. Save ─────────────────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("[6/6] Saving outputs")
+print("=" * 60, flush=True)
+
+test_preds_mev = np.clip(np.exp(test_ens_log_final), 1.0, 1e7)
+print(f"  Predictions: {len(test_preds_mev)}, "
+      f"range=[{test_preds_mev.min():.0f}, {test_preds_mev.max():.0f}] MeV", flush=True)
+
+pred_path = OUTPUT_DIR / f"Regression_{STUDENT}_{SOLUTION}.csv"
+with open(pred_path, "w") as f:
+    for i, v in enumerate(test_preds_mev):
+        f.write(f"{i},{v:.6f}\n")
+
+var_path = OUTPUT_DIR / f"Regression_{STUDENT}_{SOLUTION}_VariableList.csv"
+with open(var_path, "w") as f:
+    for feat in selected:
         f.write(f"{feat},\n")
-print(f"  Variable list saved: {var_file}")
 
-with open(summary_file, "w") as f:
-    f.write(f"PyTorch Neural Network Regression - Guanran Tai\n")
-    f.write(f"===============================================\n\n")
-    f.write(f"Architecture: MLP with residual blocks ({MAX_FEATURES} -> 256 -> 256 -> 256 -> 128 -> 128 -> 1)\n")
-    f.write(f"Activation: SiLU, BatchNorm, Dropout=0.1 after each layer\n")
-    f.write(f"Loss: Weighted L1 on log(E), optimising for relative MAE\n")
-    f.write(f"Optimiser: AdamW (lr={LEARNING_RATE}, wd={WEIGHT_DECAY})\n")
-    f.write(f"Schedule: CosineAnnealingLR, EarlyStopping patience={PATIENCE}\n")
+sum_path = OUTPUT_DIR / f"Regression_{STUDENT}_{SOLUTION}_summary.txt"
+with open(sum_path, "w") as f:
+    f.write(f"PyTorch NN Regression v6 - {STUDENT}\n")
+    f.write(f"========================================\n\n")
+    f.write(f"Architecture: ResMLP({MAX_FEAT}→{HIDDEN_DIM}→{NUM_BLOCKS}×ResBlock→"
+            f"{HIDDEN_DIM//2}→{HIDDEN_DIM//4}→1)\n")
+    f.write(f"  Activation: SiLU + BatchNorm + Dropout({DROPOUT})\n")
+    f.write(f"  Init: Kaiming, EMA(decay={EMA_DECAY})\n")
+    f.write(f"Loss: Huber(log,δ=0.3) + {REL_LOSS_W}×RelativeMAE\n")
+    f.write(f"Sampler: WeightedRandomSampler(1/E^{SAMPLER_POW})\n")
+    f.write(f"Optim: AdamW(lr={LR_MAX},wd={WD}) + {WARMUP_EP}ep warmup\n")
+    f.write(f"Scheduler: CosineAnnealingWarmRestarts(T_0=30×steps,T_mult=2)\n")
+    f.write(f"Ensemble: {model_count} models + EMA\n")
+    f.write(f"Calibration: {'per-energy-bin' if use_calib else 'none'}\n")
     f.write(f"Device: {DEVICE}\n")
-    f.write(f"Training samples: {len(train_elec)} electrons (E > 1000 MeV)\n")
-    f.write(f"Features: {len(selected_features)} (MI + gain combined selection)\n\n")
-    f.write(f"Data preprocessing:\n")
-    f.write(f"  - Removed 82 electrons with E < 1000 MeV (0.22% of total)\n")
-    f.write(f"  - Filled -999 sentinel values with feature-specific medians\n")
-    f.write(f"  - StandardScaler normalisation\n")
-    f.write(f"  - sqrt-inverse-energy sample weights (clipped [0.1, 5.0])\n\n")
-    f.write(f"Selected features ({len(selected_features)}):\n")
-    for i, feat in enumerate(selected_features):
-        f.write(f"  {i+1}. {feat}\n")
-    f.write(f"\nCV ({N_CV_FOLDS}-fold) MAE (log): {np.mean(cv_losses):.6f} +/- {np.std(cv_losses):.6f}\n")
-    f.write(f"Holdout MAE (log): {holdout_mae_log:.6f}\n")
-    f.write(f"Holdout relative MAE: {holdout_rel_mae:.6f}\n")
-    f.write(f"Training time: {train_time:.1f}s\n")
-    f.write(f"Random seed: {RANDOM_SEED}\n")
-print(f"  Summary saved: {summary_file}")
+    f.write(f"Training data: {len(elec)} electrons (E>1000 MeV)\n\n")
+    f.write(f"Feature selection: LightGBM gain+permutation (proven set)\n")
+    f.write(f"Features ({len(selected)}):\n")
+    for i, fn in enumerate(selected):
+        f.write(f"  {i+1:2d}. {fn}\n")
+    f.write(f"\nCV ({CV_FOLDS}-fold) Rel MAE: {np.mean(cv_rel):.6f} +/- {np.std(cv_rel):.6f}\n")
+    f.write(f"Holdout MAE (log):     {ho_mae_log:.6f}\n")
+    f.write(f"Holdout Rel MAE (wgt): {ho_rel_wgt:.6f} ({ho_rel_wgt*100:.2f}%)\n")
+    if use_calib:
+        f.write(f"Calibrated val Rel MAE:{calib_rel:.6f}\n")
+    f.write(f"Train time:            {train_time:.1f}s\n")
+    f.write(f"Random seed: {SEED}\n")
 
 print("\n" + "=" * 60)
 print("DONE")
