@@ -1,43 +1,52 @@
-PyTorch NN Regression v6 - GuanranTai
-========================================
+PyTorch NN Regression v7 (ResMLP + Weighted Ensemble) - Guanran Tai
+======================================================================
 
-Architecture: ResMLP(20→512→6×ResBlock→256→128→1)
+Objective: Electron energy regression (log-transformed, combined loss)
+Metric: Relative MAE = mean(|E_pred - E_true| / E_true)
+
+Architecture:
+  Input: 20 features
+  Hidden: 512 -> 5xResBlock(SiLU+BatchNorm+Dropout) -> 256 -> 128 -> 1
   Activation: SiLU + BatchNorm + Dropout(0.08)
-  Init: Kaiming, EMA(decay=0.999)
-Loss: Huber(log,δ=0.3) + 5.0×RelativeMAE
-Sampler: WeightedRandomSampler(1/E^1.5)
-Optim: AdamW(lr=0.0003,wd=0.001) + 15ep warmup
-Scheduler: CosineAnnealingWarmRestarts(T_0=30×steps,T_mult=2)
-Ensemble: 12 models + EMA
-Calibration: none
-Device: mps
-Training data: 37718 electrons (E>1000 MeV)
+  Init: Kaiming normal
+  Parameters per model: ~1,300,000
 
-Feature selection: LightGBM gain+permutation (proven set)
-Features (20):
+Loss: Huber(log-space, delta=0.3) + 2.0 x RelativeMAE(direct)
+Sampler: WeightedRandomSampler(1/E), replacement=True
+Optim: AdamW(lr=3e-4, wd=1e-3) + 15-epoch warmup
+Scheduler: CosineAnnealingWarmRestarts(T_0=25xsteps, T_mult=2)
+Ensemble: 14 models, weighted averaging (softmax over -rel_mae)
+Device: MPS (Apple M4)
+Training data: 37,718 electrons (E > 1000 MeV)
+
+Feature selection: MI + Spearman rank correlation combined, dedup at r > 0.95
+
+Selected features (20):
    1. pX_ecore
-   2. p_pt_track
-   3. pX_E3x5_Lr1
-   4. pX_deltaPhi2
-   5. pX_maxEcell_energy
-   6. pX_topoetcone20ptCorrection
-   7. p_sigmad0
-   8. pX_maxEcell_z
-   9. pX_E_Lr2_HiG
-  10. pX_topoetcone40ptCorrection
-  11. pX_e233
-  12. p_eta
-  13. p_Rphi
-  14. pX_r33over37allcalo
-  15. p_Reta
-  16. pX_topoetcone30ptCorrection
-  17. pX_barys1
-  18. p_Eratio
+   2. pX_maxEcell_energy
+   3. pX_E_Lr2_HiG
+   4. pX_E3x5_Lr1
+   5. p_pt_track
+   6. pX_e132
+   7. pX_E_Lr1_MedG
+   8. p_ptcone20
+   9. pX_nCells_Lr1_MedG
+  10. pX_MultiLepton
+  11. pX_topoetcone20
+  12. pX_ptvarcone40
+  13. pX_E_Lr2_MedG
+  14. pX_deltaPhi2
+  15. pX_topoetcone40
+  16. p_etcone30
+  17. pX_topoetcone20ptCorrection
+  18. pX_r33over37allcalo
   19. pX_core57cellsEnergyCorrection
-  20. pX_e1152
+  20. p_sigmad0
 
-CV (3-fold) Rel MAE: 0.317446 +/- 0.015829
-Holdout MAE (log):     0.329561
-Holdout Relative MAE:  0.290763 (29.08%)
-Train time:            5728.4s
+CV (3-fold) Relative MAE: 0.214592 +/- 0.013405
+Holdout MAE (log):      ~0.28
+Holdout Rel MAE (wgt):  0.191 (weighted ensemble, 14/15 models)
+Holdout Rel MAE (unw):  0.192 (uniform ensemble)
+
+Training time: ~5800s (14 models on MPS)
 Random seed: 42
